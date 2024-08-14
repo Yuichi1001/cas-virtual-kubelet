@@ -1,0 +1,11 @@
+metadata:
+   name: mysanbox     # 沙箱名，
+   namespace: default # namespace空间
+log_directory: "/root/temp"
+port_mappings:
+   - protocol: 0
+     container_port: 80
+
+# 沙箱配置
+# 理论上可以构造出 sandbox.yaml container.yaml 并解析调用 CRI 容器运行时客户端创建容器
+# 不过一般不会这样使用，会基于 k8s 的 pod 对象构建出 containerd 所需的数据格式，并调用 containerd 接口创建容器
