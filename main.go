@@ -32,7 +32,7 @@ func main() {
 	node, err := cli.New(ctx,
 		cli.WithProvider(providerName, func(cfg provider.InitConfig) (provider.Provider, error) {
 			cfg.ConfigPath = "/root/.kube/config"
-			return providers.NewCriProvider(ctx, common.SetupConfig(cfg)), nil
+			return providers.NewCasProvider(ctx, common.SetupConfig(cfg)), nil
 		}),
 		cli.WithKubernetesNodeVersion(k8sVersion),
 		// Adds flags and parsing for using logrus as the configured logger

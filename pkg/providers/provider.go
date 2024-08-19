@@ -4,225 +4,173 @@ import (
 	"context"
 	"fmt"
 	"github.com/practice/virtual-kubelet-practice/pkg/common"
-	"github.com/practice/virtual-kubelet-practice/pkg/util"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"io"
+	"github.com/virtual-kubelet/virtual-kubelet/node"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/klog"
+	"k8s.io/client-go/informers"
+	informerv1 "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes"
+	v1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"reflect"
 )
 
-// CreatePod 创建pod
-func (c *CasProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
-	return nil
+type clientCache struct {
+	nodeLister v1.NodeLister
 }
 
-// UpdatePod 更新pod
-func (c *CasProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
-	return nil
+type CasProvider struct {
+	// options 配置
+	options *common.ProviderConfig
+	// nodeName 节点名称，初始化时必须指定
+	nodeName     string
+	client       *kubernetes.Clientset
+	configured   bool
+	providerNode *common.ProviderNode
+	updatedNode  chan *corev1.Node
+	clientCache  clientCache
 }
 
-// DeletePod 删除pod
-func (c *CasProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
-	return nil
-}
+// 这是vk组件必须实现的两个接口。
+var _ node.PodLifecycleHandler = &CasProvider{}
+var _ node.PodNotifier = &CasProvider{}
 
-// GetPod 获取pod
-func (c *CasProvider) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
-	return &corev1.Pod{}, nil
-}
-
-// GetPodStatus 获取pod状态
-func (c *CasProvider) GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error) {
-	return &corev1.PodStatus{}, nil
-}
-
-// GetPods 获取pod列表
-func (c *CasProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
-	return nil, nil
-}
-
-// GetContainerLogs 获取容器日志
-func (c *CasProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	klog.Infof("获取pod name: %s namespace: %s container name: %s 日志", podName, namespace, containerName)
-	return nil, nil
-}
-
-// RunInContainer 执行pod中的容器逻辑
-func (c *CasProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
-	return nil
-}
-
-// ConfigureNode 初始化自定义node节点信息
-func (c *CasProvider) ConfigureNode(ctx context.Context, node *corev1.Node) {
-	//node.Status.Capacity = nodeCapacity(c.options.ResourceCPU, c.options.ResourceMemory, c.options.MaxPod)
-	//node.Status.Conditions = nodeConditions()
-	//node.Status.Addresses = nodeAddresses(c.options.InternalIp)
-	//node.Status.DaemonEndpoints = nodeDaemonEndpoints(int(c.options.DaemonEndpointPort))
-	//node.Status.NodeInfo.OperatingSystem = c.options.OperatingSystem
-	nodes, err := c.clientCache.nodeLister.List(labels.Everything())
+func NewCasProvider(ctx context.Context, options *common.ProviderConfig) *CasProvider {
+	config, err := clientcmd.BuildConfigFromFlags("", options.ClientConfig)
 	if err != nil {
+		fmt.Println("BuildConfigFromFlags_err:", err)
+		return nil
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		fmt.Println("newforconfig_err:", err)
+		return nil
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+
+	provider := &CasProvider{
+		options:  options,
+		nodeName: options.NodeName,
+		client:   clientset,
+		clientCache: clientCache{
+			nodeLister: nodeInformer.Lister(),
+		},
+		updatedNode:  make(chan *corev1.Node, 100),
+		providerNode: &common.ProviderNode{},
+	}
+
+	provider.buildNodeInformer(nodeInformer)
+
+	informerFactory.Start(ctx.Done())
+	informerFactory.WaitForCacheSync(ctx.Done())
+
+	return provider
+}
+
+func (c *CasProvider) buildNodeInformer(nodeInformer informerv1.NodeInformer) {
+
+	nodeInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			//添加节点时无需addresource，因为新加入的节点从notready变为ready时会触发update，在updatefunc里面进行addresource
+			AddFunc: func(obj interface{}) {
+				/*if !c.configured {
+					return
+				}
+				nodeCopy := c.providerNode.DeepCopy()
+				addNode := obj.(*corev1.Node).DeepCopy()
+				fmt.Println(addNode.Name)
+				toAdd := common.ConvertResource(addNode.Status.Capacity)
+				if err := c.providerNode.AddResource(toAdd); err != nil {
+					return
+				}
+				// resource we did not add when ConfigureNode should sub
+				//p.providerNode.SubResource(p.getResourceFromPodsByNodeName(addNode.Name))
+				copy := c.providerNode.DeepCopy()
+				if !reflect.DeepEqual(nodeCopy, copy) {
+					c.updatedNode <- copy
+				}*/
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				if !c.configured {
+					return
+				}
+				old, ok1 := oldObj.(*corev1.Node)
+				new, ok2 := newObj.(*corev1.Node)
+				oldCopy := old.DeepCopy()
+				newCopy := new.DeepCopy()
+				if !ok1 || !ok2 {
+					return
+				}
+				c.updateVKCapacityFromNode(oldCopy, newCopy)
+			},
+			DeleteFunc: func(obj interface{}) {
+				if !c.configured {
+					return
+				}
+				deleteNode := obj.(*corev1.Node).DeepCopy()
+				if deleteNode.Spec.Unschedulable || !checkNodeStatusReady(deleteNode) {
+					return
+				}
+				nodeCopy := c.providerNode.DeepCopy()
+				toRemove := common.ConvertResource(deleteNode.Status.Capacity)
+				if err := c.providerNode.SubResource(toRemove); err != nil {
+					return
+				}
+				// resource we did not add when ConfigureNode should add
+				//p.providerNode.AddResource(p.getResourceFromPodsByNodeName(deleteNode.Name))
+				copy := c.providerNode.DeepCopy()
+				if !reflect.DeepEqual(nodeCopy, copy) {
+					c.updatedNode <- copy
+				}
+			},
+		},
+	)
+}
+
+func checkNodeStatusReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type != corev1.NodeReady {
+			continue
+		}
+		if condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func compareNodeStatusReady(old, new *corev1.Node) (bool, bool) {
+	return checkNodeStatusReady(old), checkNodeStatusReady(new)
+}
+
+func (c *CasProvider) updateVKCapacityFromNode(old, new *corev1.Node) {
+	oldStatus, newStatus := compareNodeStatusReady(old, new)
+	if !oldStatus && !newStatus {
 		return
 	}
+	toRemove := common.ConvertResource(old.Status.Capacity)
+	toAdd := common.ConvertResource(new.Status.Capacity)
+	nodeCopy := c.providerNode.DeepCopy()
 
-	nodeResource := common.NewResource()
+	if c.providerNode.Node == nil {
+		return
+	} else if old.Spec.Unschedulable && !new.Spec.Unschedulable || newStatus && !oldStatus {
+		c.providerNode.AddResource(toAdd)
+		//v.providerNode.SubResource(v.getResourceFromPodsByNodeName(old.Name))
+	} else if !old.Spec.Unschedulable && new.Spec.Unschedulable || oldStatus && !newStatus {
+		//v.providerNode.AddResource(v.getResourceFromPodsByNodeName(old.Name))
+		c.providerNode.SubResource(toRemove)
 
-	for _, n := range nodes {
-		if n.Spec.Unschedulable {
-			continue
-		}
-		if !checkNodeStatusReady(n) {
-			klog.Infof("Node %v not ready", node.Name)
-			continue
-		}
-		nc := common.ConvertResource(n.Status.Capacity)
-		nodeResource.Add(nc)
+	} else if !reflect.DeepEqual(old.Status.Allocatable, new.Status.Allocatable) ||
+		!reflect.DeepEqual(old.Status.Capacity, new.Status.Capacity) {
+		c.providerNode.AddResource(toAdd)
+		c.providerNode.SubResource(toRemove)
 	}
-	nodeResource.SetCapacityToNode(node)
-	node.Status.NodeInfo.OperatingSystem = "linux"
-	node.Status.NodeInfo.Architecture = "amd64"
-	node.ObjectMeta.Labels[corev1.LabelArchStable] = "amd64"
-	node.ObjectMeta.Labels[corev1.LabelOSStable] = "linux"
-	node.ObjectMeta.Labels[util.LabelOSBeta] = "linux"
-	node.Status.Conditions = nodeConditions()
-	c.providerNode.Node = node
-	c.configured = true
-	return
-}
-
-// Ping tries to connect to client cluster
-// implement node.NodeProvider
-func (c *CasProvider) Ping(ctx context.Context) error {
-
-	_, err := c.client.Discovery().ServerVersion()
-	if err != nil {
-		klog.Error("Failed ping")
-		return fmt.Errorf("could not list client apiserver statuses: %v", err)
-	}
-	return nil
-}
-
-// NotifyNodeStatus is used to asynchronously monitor the node.
-// The passed in callback should be called any time there is a change to the
-// node's status.
-// This will generally trigger a call to the Kubernetes API server to update
-// the status.
-//
-// NotifyNodeStatus should not block callers.
-func (c *CasProvider) NotifyNodeStatus(ctx context.Context, f func(*corev1.Node)) {
-	klog.Info("Called NotifyNodeStatus")
-	go func() {
-		for {
-			select {
-			case node := <-c.updatedNode:
-				klog.Infof("Enqueue updated node %v", node.Name)
-				f(node)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-}
-
-// nodeDaemonEndpoints returns NodeDaemonEndpoints for the node status
-// within Kubernetes.
-func (c *CasProvider) nodeDaemonEndpoints() corev1.NodeDaemonEndpoints {
-	return corev1.NodeDaemonEndpoints{
-		KubeletEndpoint: corev1.DaemonEndpoint{
-			//Port: c.daemonPort,
-		},
-	}
-}
-
-// getResourceFromPods summary the resource already used by pods.
-func (c *CasProvider) getResourceFromPods() *common.Resource {
-	podResource := common.NewResource()
-	/*pods, err := v.clientCache.podLister.List(labels.Everything())
-	if err != nil {
-		return podResource
-	}
-	for _, pod := range pods {
-		if pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName != "" ||
-			pod.Status.Phase == corev1.PodRunning {
-			nodeName := pod.Spec.NodeName
-			node, err := v.clientCache.nodeLister.Get(nodeName)
-			if err != nil {
-				klog.Infof("get node %v failed err: %v", nodeName, err)
-				continue
-			}
-			if node.Spec.Unschedulable || !checkNodeStatusReady(node) {
-				continue
-			}
-			res := util.GetRequestFromPod(pod)
-			res.Pods = resource.MustParse("1")
-			podResource.Add(res)
-		}
-	}*/
-	return podResource
-}
-
-// getResourceFromPodsByNodeName summary the resource already used by pods according to nodeName
-func (c *CasProvider) getResourceFromPodsByNodeName(nodeName string) *common.Resource {
-	podResource := common.NewResource()
-	/*fieldSelector, err := fields.ParseSelector("spec.nodeName=" + nodeName)
-	pods, err := v.client.CoreV1().Pods(corev1.NamespaceAll).List(context.TODO(),
-		metav1.ListOptions{
-			FieldSelector: fieldSelector.String(),
-		})
-	if err != nil {
-		return podResource
-	}
-	for _, pod := range pods.Items {
-		if util.IsVirtualPod(&pod) {
-			continue
-		}
-		if pod.Status.Phase == corev1.PodPending ||
-			pod.Status.Phase == corev1.PodRunning {
-			res := util.GetRequestFromPod(&pod)
-			res.Pods = resource.MustParse("1")
-			podResource.Add(res)
-		}
-	}*/
-	return podResource
-}
-
-// nodeConditions creates a slice of node conditions representing a
-// kubelet in perfect health. These four conditions are the ones which virtual-kubelet
-// sets as Unknown when a Ping fails.
-func nodeConditions() []corev1.NodeCondition {
-	return []corev1.NodeCondition{
-		{
-			Type:               "Ready",
-			Status:             corev1.ConditionTrue,
-			LastHeartbeatTime:  metav1.Now(),
-			LastTransitionTime: metav1.Now(),
-			Reason:             "KubeletReady",
-			Message:            "kubelet is posting ready status",
-		},
-		{
-			Type:               "MemoryPressure",
-			Status:             corev1.ConditionFalse,
-			LastHeartbeatTime:  metav1.Now(),
-			LastTransitionTime: metav1.Now(),
-			Reason:             "KubeletHasSufficientMemory",
-			Message:            "kubelet has sufficient memory available",
-		},
-		{
-			Type:               "DiskPressure",
-			Status:             corev1.ConditionFalse,
-			LastHeartbeatTime:  metav1.Now(),
-			LastTransitionTime: metav1.Now(),
-			Reason:             "KubeletHasNoDiskPressure",
-			Message:            "kubelet has no disk pressure",
-		},
-		{
-			Type:               "PIDPressure",
-			Status:             corev1.ConditionFalse,
-			LastHeartbeatTime:  metav1.Now(),
-			LastTransitionTime: metav1.Now(),
-			Reason:             "KubeletHasSufficientPID",
-			Message:            "kubelet has sufficient PID available",
-		},
+	copy := c.providerNode.DeepCopy()
+	if !reflect.DeepEqual(nodeCopy, copy) {
+		c.updatedNode <- copy
 	}
 }
