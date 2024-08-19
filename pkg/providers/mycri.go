@@ -2,18 +2,18 @@ package providers
 
 import (
 	"context"
-	"k8s.io/klog/v2"
-	"os"
-	"path/filepath"
-	"time"
-
+	"fmt"
 	"github.com/practice/virtual-kubelet-practice/pkg/common"
-	"github.com/practice/virtual-kubelet-practice/pkg/remote"
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	criapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/informers"
+	informerv1 "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes"
+	v1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"os"
+	"reflect"
 )
 
 const (
@@ -23,12 +23,15 @@ const (
 	PodVolRootPerms = 0755
 )
 
-// CriProvider 实现virtual-kubelet对象
-type CriProvider struct {
+// clientCache wraps the lister of client cluster
+type clientCache struct {
+	nodeLister v1.NodeLister
+}
+
+// CasProvider 实现virtual-kubelet对象
+type CasProvider struct {
 	// options 配置
 	options *common.ProviderConfig
-	// cri客户端，包含runtimeService imageService
-	remoteCRI *remote.CRIContainer
 	// PodManager 管理pods状态管理
 	PodManager *PodManager
 	// podLogRoot 存放容器日志目录
@@ -41,337 +44,201 @@ type CriProvider struct {
 	checkPeriod int64
 	notifyC     chan struct{}
 	// 上报的回调方法，主要把本节点中的pod status放入工作队列
-	notifyStatus func(*v1.Pod)
+	notifyStatus func(*corev1.Pod)
 
-	// 模拟实现，
-	// TODO: 发消息管理器，主要负责发送消息通知，是否发送消息，可以使用annotation标示发送
-	// TODO: 数据库存储
+	client       *kubernetes.Clientset
+	configured   bool
+	providerNode *common.ProviderNode
+	updatedNode  chan *corev1.Node
+	clientCache  clientCache
 }
 
 // 是否实现下列两种接口，这是vk组件必须实现的两个接口。
-var _ node.PodLifecycleHandler = &CriProvider{}
-var _ node.PodNotifier = &CriProvider{}
+var _ node.PodLifecycleHandler = &CasProvider{}
+var _ node.PodNotifier = &CasProvider{}
 
-func NewCriProvider(options *common.ProviderConfig, criClient *remote.CRIContainer) *CriProvider {
+func NewCriProvider(ctx context.Context, options *common.ProviderConfig) *CasProvider {
+	config, err := clientcmd.BuildConfigFromFlags("", options.ClientConfig)
+	if err != nil {
+		fmt.Println("BuildConfigFromFlags_err:", err)
+		return nil
+	}
 
-	c := &CriProvider{
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		fmt.Println("newforconfig_err:", err)
+		return nil
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+
+	provider := &CasProvider{
 		options:    options,
-		remoteCRI:  criClient,
 		podLogRoot: PodLogRoot,
 		podVolRoot: PodVolRoot,
 		PodManager: NewPodManager(),
 		nodeName:   options.NodeName,
 		notifyC:    make(chan struct{}),
+		client:     clientset,
+		clientCache: clientCache{
+			nodeLister: nodeInformer.Lister(),
+		},
+		updatedNode:  make(chan *corev1.Node, 100),
+		providerNode: &common.ProviderNode{},
 	}
+
+	provider.buildNodeInformer(nodeInformer)
+
+	informerFactory.Start(ctx.Done())
+	informerFactory.WaitForCacheSync(ctx.Done())
+
 	// 初始化时先创建目录
-	err := os.MkdirAll(c.podLogRoot, PodLogRootPerms)
+	err = os.MkdirAll(provider.podLogRoot, PodLogRootPerms)
 	if err != nil {
 		return nil
 	}
-	err = os.MkdirAll(c.podVolRoot, PodVolRootPerms)
+	err = os.MkdirAll(provider.podVolRoot, PodVolRootPerms)
 	if err != nil {
 		return nil
 	}
-	return c
+
+	return provider
+}
+
+func (c *CasProvider) buildNodeInformer(nodeInformer informerv1.NodeInformer) {
+
+	nodeInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			//添加节点时无需addresource，因为新加入的节点从notready变为ready时会触发update，在updatefunc里面进行addresource
+			AddFunc: func(obj interface{}) {
+				/*if !c.configured {
+					return
+				}
+				nodeCopy := c.providerNode.DeepCopy()
+				addNode := obj.(*corev1.Node).DeepCopy()
+				fmt.Println(addNode.Name)
+				toAdd := common.ConvertResource(addNode.Status.Capacity)
+				if err := c.providerNode.AddResource(toAdd); err != nil {
+					return
+				}
+				// resource we did not add when ConfigureNode should sub
+				//p.providerNode.SubResource(p.getResourceFromPodsByNodeName(addNode.Name))
+				copy := c.providerNode.DeepCopy()
+				if !reflect.DeepEqual(nodeCopy, copy) {
+					c.updatedNode <- copy
+				}*/
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				if !c.configured {
+					return
+				}
+				old, ok1 := oldObj.(*corev1.Node)
+				new, ok2 := newObj.(*corev1.Node)
+				oldCopy := old.DeepCopy()
+				newCopy := new.DeepCopy()
+				if !ok1 || !ok2 {
+					return
+				}
+				c.updateVKCapacityFromNode(oldCopy, newCopy)
+			},
+			DeleteFunc: func(obj interface{}) {
+				if !c.configured {
+					return
+				}
+				deleteNode := obj.(*corev1.Node).DeepCopy()
+				if deleteNode.Spec.Unschedulable || !checkNodeStatusReady(deleteNode) {
+					return
+				}
+				nodeCopy := c.providerNode.DeepCopy()
+				toRemove := common.ConvertResource(deleteNode.Status.Capacity)
+				if err := c.providerNode.SubResource(toRemove); err != nil {
+					return
+				}
+				// resource we did not add when ConfigureNode should add
+				//p.providerNode.AddResource(p.getResourceFromPodsByNodeName(deleteNode.Name))
+				copy := c.providerNode.DeepCopy()
+				if !reflect.DeepEqual(nodeCopy, copy) {
+					c.updatedNode <- copy
+				}
+			},
+		},
+	)
+}
+
+func checkNodeStatusReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type != corev1.NodeReady {
+			continue
+		}
+		if condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func compareNodeStatusReady(old, new *corev1.Node) (bool, bool) {
+	return checkNodeStatusReady(old), checkNodeStatusReady(new)
+}
+
+/*
+// getResourceFromPodsByNodeName summary the resource already used by pods according to nodeName
+func (v *CasProvider) getResourceFromPodsByNodeName(nodeName string) *common.Resource {
+	podResource := common.NewResource()
+	fieldSelector, err := fields.ParseSelector("spec.nodeName=" + nodeName)
+	pods, err := v.client.CoreV1().Pods(corev1.NamespaceAll).List(context.TODO(),
+		metav1.ListOptions{
+			FieldSelector: fieldSelector.String(),
+		})
+	if err != nil {
+		return podResource
+	}
+	for _, pod := range pods.Items {
+		if util.IsVirtualPod(&pod) {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodPending ||
+			pod.Status.Phase == corev1.PodRunning {
+			res := util.GetRequestFromPod(&pod)
+			res.Pods = resource.MustParse("1")
+			podResource.Add(res)
+		}
+	}
+	return podResource
+}*/
+
+func (c *CasProvider) updateVKCapacityFromNode(old, new *corev1.Node) {
+	oldStatus, newStatus := compareNodeStatusReady(old, new)
+	if !oldStatus && !newStatus {
+		return
+	}
+	toRemove := common.ConvertResource(old.Status.Capacity)
+	toAdd := common.ConvertResource(new.Status.Capacity)
+	nodeCopy := c.providerNode.DeepCopy()
+
+	if c.providerNode.Node == nil {
+		return
+	} else if old.Spec.Unschedulable && !new.Spec.Unschedulable || newStatus && !oldStatus {
+		c.providerNode.AddResource(toAdd)
+		//v.providerNode.SubResource(v.getResourceFromPodsByNodeName(old.Name))
+	} else if !old.Spec.Unschedulable && new.Spec.Unschedulable || oldStatus && !newStatus {
+		//v.providerNode.AddResource(v.getResourceFromPodsByNodeName(old.Name))
+		c.providerNode.SubResource(toRemove)
+
+	} else if !reflect.DeepEqual(old.Status.Allocatable, new.Status.Allocatable) ||
+		!reflect.DeepEqual(old.Status.Capacity, new.Status.Capacity) {
+		c.providerNode.AddResource(toAdd)
+		c.providerNode.SubResource(toRemove)
+	}
+	copy := c.providerNode.DeepCopy()
+	if !reflect.DeepEqual(nodeCopy, copy) {
+		c.updatedNode <- copy
+	}
 }
 
 // NotifyPods 异步更新pod的状态。
 // 需要实现 node.PodNotifier 对象
-func (c *CriProvider) NotifyPods(ctx context.Context, notifyStatus func(*v1.Pod)) {
-	c.notifyStatus = notifyStatus
-	go c.checkPodStatusLoop(ctx)
-	go c.checkSamplePodStatusLoop()
-}
+func (c *CasProvider) NotifyPods(ctx context.Context, notifyStatus func(*corev1.Pod)) {
 
-// FIXME: 暂时使用此方式 通知
-func (c *CriProvider) checkSamplePodStatusLoop() {
-	for {
-		select {
-		case <-c.notifyC:
-			var pods []*v1.Pod
-
-			for _, ps := range c.PodManager.samplePodStatus {
-				pods = append(pods, createPodSpecFromCRI(&ps, c.nodeName))
-			}
-
-			for _, pod := range pods {
-				c.notifyStatus(pod)
-			}
-		}
-	}
-
-}
-
-const defaultCheckPeriod = 5
-
-// checkPodStatusLoop 定时检查pod状态
-func (c *CriProvider) checkPodStatusLoop(ctx context.Context) {
-	if c.checkPeriod <= 0 {
-		c.checkPeriod = defaultCheckPeriod
-	}
-	t := time.NewTimer(time.Duration(c.checkPeriod))
-	if !t.Stop() {
-		<-t.C
-	}
-	// 重新计时执行
-	for {
-		t.Reset(time.Duration(c.checkPeriod) * time.Second)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-
-		if err := c.notifyPodStatuses(ctx); err != nil {
-			klog.Error("notifyPodStatuses err: ", err)
-		}
-	}
-}
-
-// notifyPodStatuses 获取pod，并通知node节点上报
-func (c *CriProvider) notifyPodStatuses(ctx context.Context) error {
-	pods, err := c.getPods(ctx)
-	if err != nil {
-		klog.Error("get pods err: ", err)
-		return err
-	}
-
-	for _, pod := range pods {
-		c.notifyStatus(pod)
-	}
-
-	return nil
-}
-
-// createPod 创建pod业务逻辑
-func (c *CriProvider) createPod(ctx context.Context, pod *v1.Pod) error {
-
-	var attempt uint32 // TODO: Track attempts. Currently always 0
-	logPath := filepath.Join(c.podLogRoot, string(pod.UID))
-	volPath := filepath.Join(c.podVolRoot, string(pod.UID))
-	// 刷新node中状态
-	err := c.refreshNodeState(ctx)
-	if err != nil {
-		klog.Error("refreshNodeState err: ", err)
-		return err
-	}
-	// 生成pod sandbox配置文件
-	pConfig, err := remote.GeneratePodSandboxConfig(ctx, pod, logPath, attempt)
-	if err != nil {
-		klog.Error("GeneratePodSandboxConfig err: ", err)
-		return err
-	}
-	// 获取pod对象，用于判断是否创建过。
-	existing := c.findPodByName(pod.Namespace, pod.Name)
-
-	// TODO: Is re-using an existing sandbox with the UID the correct behavior?
-	// TODO: Should delete the sandbox if container creation fails
-	var pId string
-	if existing == nil {
-		err = os.MkdirAll(logPath, 0755)
-		if err != nil {
-			return err
-		}
-		err = os.MkdirAll(volPath, 0755)
-		if err != nil {
-			return err
-		}
-		// 创建pod sandbox
-		pId, err = remote.RunPodSandbox(ctx, c.remoteCRI.RuntimeService, pConfig)
-		if err != nil {
-			klog.Error("RunPodSandbox err: ", err)
-			return err
-		}
-	} else {
-		pId = existing.status.Metadata.Uid
-	}
-
-	klog.Infof("PodSandbox id %s", pId)
-
-	// 执行创建容器相关的操作
-	for _, cs := range pod.Spec.Containers {
-		// 拉取镜像
-		imageRef, err := remote.PullImage(ctx, c.remoteCRI.ImageService, cs.Image)
-		if err != nil {
-			klog.Error("PullImage err: ", err)
-			return err
-		}
-
-		klog.Infof("Creating container %s", cs.Name)
-		//cConfig, err := remote.GenerateContainerConfig(ctx, &cs, pod, imageRef, volPath, c.resourceManager, attempt)
-		// 生成容器配置文件
-		cConfig, err := remote.GenerateContainerConfig(ctx, &cs, pod, imageRef, volPath, attempt)
-		if err != nil {
-			klog.Error("GenerateContainerConfig err: ", err)
-			return err
-		}
-		// 创建容器
-		cId, err := remote.CreateContainer(ctx, c.remoteCRI.RuntimeService, cConfig, pConfig, pId)
-		if err != nil {
-			klog.Error("CreateContainer err: ", err)
-			return err
-		}
-
-		klog.Infof("Starting container %s", cs.Name)
-		// 运行容器
-		err = remote.StartContainer(context.Background(), c.remoteCRI.RuntimeService, cId)
-		if err != nil {
-			klog.Error("StartContainer err: ", err)
-			return err
-		}
-	}
-	c.notifyStatus(pod)
-	return err
-}
-
-// deletePod 删除pod业务逻辑
-func (c *CriProvider) deletePod(ctx context.Context, pod *v1.Pod) error {
-	klog.Infof("receive DeletePod %s", pod.Name)
-	// 刷新node中的pod状态
-	err := c.refreshNodeState(ctx)
-	if err != nil {
-		klog.Errorf("refreshNodeState err: %s", err)
-		return err
-	}
-
-	ps, ok := c.PodManager.podStatus[pod.UID]
-	if !ok {
-		return errdefs.NotFoundf("Pod %s not found", pod.UID)
-	}
-
-	// TODO: Check pod status for running state
-	// 停止pod sandbox
-	err = remote.StopPodSandbox(ctx, c.remoteCRI.RuntimeService, ps.status.Id)
-	if err != nil {
-		// Note the error, but shouldn't prevent us trying to delete
-		klog.Error("StopPodSandbox err: ", err)
-	}
-
-	// 删除日志文件
-	err = os.RemoveAll(filepath.Join(c.podVolRoot, string(pod.UID)))
-	if err != nil {
-		klog.Error("Remove file err: ", err)
-	}
-	// 删除pod sandbox
-	err = remote.RemovePodSandbox(ctx, c.remoteCRI.RuntimeService, ps.status.Id)
-	if err != nil {
-		klog.Error("RemovePodSandbox err: ", err)
-		return err
-	}
-	c.notifyStatus(pod)
-	return err
-}
-
-// getPod 获取pod
-func (c *CriProvider) getPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
-	// 刷新node中pod状态
-	err := c.refreshNodeState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// 查到pod
-	pod := c.findPodByName(namespace, name)
-	if pod == nil {
-		return nil, errdefs.NotFoundf("Pod %s in namespace %s could not be found on the node", name, namespace)
-	}
-
-	return createPodSpecFromCRI(pod, c.nodeName), nil
-}
-
-// getPod 获取pod列表
-func (c *CriProvider) getPods(ctx context.Context) ([]*v1.Pod, error) {
-	var pods []*v1.Pod
-	// 刷新node中pod状态
-	err := c.refreshNodeState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// 生成k8s中的pod对象
-	for _, ps := range c.PodManager.podStatus {
-		pods = append(pods, createPodSpecFromCRI(&ps, c.nodeName))
-	}
-	// 生成k8s中的pod对象
-	for _, ps := range c.PodManager.samplePodStatus {
-		pods = append(pods, createPodSpecFromCRI(&ps, c.nodeName))
-	}
-	return pods, nil
-}
-
-// findPodByName 从内存中获取pod状态
-func (c *CriProvider) findPodByName(namespace, name string) *PodStatus {
-	var found *PodStatus
-
-	for _, pod := range c.PodManager.getSamplePodStatus() {
-		if pod.status.Metadata.Name == name && pod.status.Metadata.Namespace == namespace {
-			found = &pod
-			break
-		}
-	}
-
-	for _, pod := range c.PodManager.getPodStatus() {
-		if pod.status.Metadata.Name == name && pod.status.Metadata.Namespace == namespace {
-			found = &pod
-			break
-		}
-	}
-	return found
-}
-
-// getPodStatus 获取pod状态
-func (c *CriProvider) getPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
-	//log.G(ctx).Debugf("receive GetPodStatus %q", name)
-	// 刷新node中pod状态
-	err := c.refreshNodeState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// 获取pod
-	pod := c.findPodByName(namespace, name)
-	if pod == nil {
-		return nil, errdefs.NotFoundf("pod %s in namespace %s could not be found on the node", name, namespace)
-	}
-	// 返回k8s中pod对象
-	return createPodStatusFromCRI(pod), nil
-}
-
-// refreshNodeState 更新node中的pod状态
-func (c *CriProvider) refreshNodeState(ctx context.Context) (retErr error) {
-	// 获取pod sandbox
-	allPods, err := remote.GetPodSandboxes(ctx, c.remoteCRI.RuntimeService)
-	if err != nil {
-		return err
-	}
-
-	newStatus := make(map[types.UID]PodStatus)
-	for _, pod := range allPods {
-		psId := pod.Id
-		// 获取pod sandbox状态
-		pss, err := remote.GetPodSandboxStatus(ctx, c.remoteCRI.RuntimeService, psId)
-		if err != nil {
-			return err
-		}
-		// 取得特定pod sandbox下的容器组
-		containers, err := remote.GetContainersForSandbox(ctx, c.remoteCRI.RuntimeService, psId)
-		if err != nil {
-			return err
-		}
-
-		var css = make(map[string]*criapi.ContainerStatus)
-		for _, cc := range containers {
-			// 获取容器的状态
-			cstatus, err := remote.GetContainerCRIStatus(context.Background(), c.remoteCRI.RuntimeService, cc.Id)
-			if err != nil {
-				return err
-			}
-			css[cstatus.Metadata.Name] = cstatus
-		}
-
-		newStatus[types.UID(pss.Metadata.Uid)] = PodStatus{
-			id:         pod.Id,
-			status:     pss,
-			containers: css,
-		}
-	}
-	c.PodManager.podStatus = newStatus
-	return nil
 }

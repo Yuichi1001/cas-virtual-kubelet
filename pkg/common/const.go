@@ -1,9 +1,12 @@
 package common
 
-import "github.com/virtual-kubelet/node-cli/provider"
+import (
+	"github.com/virtual-kubelet/node-cli/provider"
+)
 
 // ProviderConfig provider 配置文件
 type ProviderConfig struct {
+	ClientConfig string
 	// NodeName 节点名
 	NodeName string
 	// OperatingSystem 启动节点的操作系统
@@ -23,6 +26,7 @@ type ProviderConfig struct {
 // SetupConfig 设置配置文件
 func SetupConfig(cfg provider.InitConfig) *ProviderConfig {
 	return &ProviderConfig{
+		ClientConfig:       cfg.ConfigPath,
 		NodeName:           cfg.NodeName,
 		OperatingSystem:    cfg.OperatingSystem,
 		DaemonEndpointPort: cfg.DaemonPort,

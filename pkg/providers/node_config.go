@@ -1,12 +1,9 @@
 package providers
 
+/*
 import (
-	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"runtime"
-	"strconv"
 )
 
 // nodeDaemonEndpoints 返回节点端口
@@ -77,23 +74,4 @@ func nodeConditions() []v1.NodeCondition {
 		},
 	}
 
-}
-
-// nodeCapacity 节点资源信息如：CPU or 内存 or 最大承受pod数量
-func nodeCapacity(resourceCPU, resourceMemory, maxPod string) v1.ResourceList {
-	if resourceCPU == "" {
-		resourceCPU = strconv.Itoa(runtime.NumCPU())
-	}
-	if resourceMemory == "" {
-		resourceMemory = strconv.Itoa(1024 * 1024 * 1024 * 500)
-	}
-	if maxPod == "" {
-		maxPod = "200"
-	}
-
-	return v1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(resourceCPU),
-		corev1.ResourceMemory: resource.MustParse(resourceMemory),
-		corev1.ResourcePods:   resource.MustParse(maxPod), //最多创建
-	}
-}
+}*/

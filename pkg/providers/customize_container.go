@@ -35,10 +35,10 @@ func (cc *ContainerCmd) Run() (string, string, error) {
 			cc.ExecError = err
 		}
 	}
-	return string(stdout.Bytes()), string(stderr.Bytes()),err
+	return string(stdout.Bytes()), string(stderr.Bytes()), err
 }
 
-func (c *CriProvider) createSamplePod(_ context.Context, pod *v1.Pod) error {
+func (c *CasProvider) createSamplePod(_ context.Context, pod *v1.Pod) error {
 	// 1. 封装为ContainerCmd对象
 	cmds := make([]*ContainerCmd, 0)
 	for _, c := range pod.Spec.Containers {
@@ -85,7 +85,7 @@ func (c *CriProvider) createSamplePod(_ context.Context, pod *v1.Pod) error {
 			CreatedAt: time.Now().Unix(),
 			StartedAt: time.Now().Add(time.Second * 3).Unix(),
 			State:     criapi.ContainerState_CONTAINER_CREATED,
-			Message: "Creating",
+			Message:   "Creating",
 		}
 
 		c.notifyC <- struct{}{}
@@ -114,7 +114,6 @@ func (c *CriProvider) createSamplePod(_ context.Context, pod *v1.Pod) error {
 			c.notifyC <- struct{}{}
 		}()
 
-
 	}
 
 	c.notifyStatus(pod)
@@ -122,7 +121,7 @@ func (c *CriProvider) createSamplePod(_ context.Context, pod *v1.Pod) error {
 
 }
 
-func (c *CriProvider) deleteSamplePod(_ context.Context, pod *v1.Pod) error {
+func (c *CasProvider) deleteSamplePod(_ context.Context, pod *v1.Pod) error {
 	ps, ok := c.PodManager.samplePodStatus[pod.UID]
 	if !ok {
 		return errdefs.NotFoundf("Pod %s not found", pod.UID)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"github.com/practice/virtual-kubelet-practice/pkg/common"
 	"github.com/practice/virtual-kubelet-practice/pkg/providers"
-	"github.com/practice/virtual-kubelet-practice/pkg/remote"
 	"github.com/sirupsen/logrus"
 	cli "github.com/virtual-kubelet/node-cli"
 	//"github.com/virtual-kubelet/node-cli/opts"
@@ -15,16 +14,14 @@ import (
 )
 
 const (
-	k8sVersion   = "v1.22.0"
-	providerName = "example-provider"
+	k8sVersion   = "v1.29.3"
+	providerName = "cas-vk"
 )
 
 // 启动命令
 // go run main.go --provider example-provider --kubeconfig ./config/config.yaml --nodename mynode
 
 func main() {
-
-	remoteCRI := remote.NewRemoteCRIContainer(common.R, common.I)
 
 	ctx := cli.ContextWithCancelOnSignal(context.Background())
 	logger := logrus.StandardLogger()
@@ -34,7 +31,8 @@ func main() {
 
 	node, err := cli.New(ctx,
 		cli.WithProvider(providerName, func(cfg provider.InitConfig) (provider.Provider, error) {
-			return providers.NewCriProvider(common.SetupConfig(cfg), remoteCRI), nil
+			cfg.ConfigPath = "/root/.kube/config"
+			return providers.NewCriProvider(ctx, common.SetupConfig(cfg)), nil
 		}),
 		cli.WithKubernetesNodeVersion(k8sVersion),
 		// Adds flags and parsing for using logrus as the configured logger
